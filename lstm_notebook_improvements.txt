@@ -1,0 +1,376 @@
+# LSTM Notebook Improvements for House Price Prediction
+
+Based on the visualization showing poor prediction of high-value properties, here are the improvements to add to your notebook:
+
+## 1. Add Required Imports
+
+```python
+import statsmodels.api as sm
+from tqdm.notebook import tqdm
+from sklearn.preprocessing import RobustScaler
+from tensorflow.keras.losses import Huber
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+```
+
+## 2. Analyze the Price Distribution
+
+Add this code cell after your data loading section:
+
+```python
+# Analyze price distribution
+plt.figure(figsize=(12, 6))
+sns.histplot(df['TotalPrice'], bins=50, kde=True)
+plt.axvline(x=5000, color='r', linestyle='--', label='5,000')
+plt.axvline(x=10000, color='g', linestyle='--', label='10,000')
+plt.title('House Price Distribution', fontsize=16)
+plt.xlabel('Price', fontsize=12)
+plt.ylabel('Frequency', fontsize=12)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# Calculate price percentiles
+percentiles = [50, 75, 90, 95, 99]
+for p in percentiles:
+    value = np.percentile(df['TotalPrice'], p)
+    print(f"{p}th percentile: {value:.2f}")
+
+# Count high-value properties
+high_value_threshold = 10000
+high_value_count = (df['TotalPrice'] >= high_value_threshold).sum()
+print(f"Properties with price >= {high_value_threshold}: {high_value_count} ({high_value_count/len(df)*100:.2f}%)")
+```
+
+## 3. Log Transform the Target Variable
+
+Replace your existing target variable processing with:
+
+```python
+# Apply log transformation to handle price skewness
+y_original = df['TotalPrice']
+y_log = np.log1p(y_original)  # log(1+x) to handle zeros
+
+# Compare distributions
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+sns.histplot(y_original, kde=True)
+plt.title('Original Price Distribution')
+
+plt.subplot(1, 2, 2)
+sns.histplot(y_log, kde=True)
+plt.title('Log-Transformed Price Distribution')
+
+plt.tight_layout()
+plt.show()
+
+# Use transformed target for modeling
+y = y_log
+```
+
+## 4. Use Robust Scaling Instead of MinMax
+
+Replace your MinMaxScaler with:
+
+```python
+# Use RobustScaler which is less sensitive to outliers
+X_scaler = RobustScaler()
+X_scaled = X_scaler.fit_transform(X)
+
+# For target variable, keep using the log transform
+y_scaler = RobustScaler()
+y_scaled = y_scaler.fit_transform(y.values.reshape(-1, 1))
+```
+
+## 5. Apply Stratified Sampling to Ensure High-Value Properties are in Training
+
+Add this before your train_test_split:
+
+```python
+# Create price bins for stratified sampling
+bins = [0, 5000, 10000, 20000, np.inf]
+labels = ['low', 'medium', 'high', 'very_high']
+price_bins = pd.cut(y_original, bins=bins, labels=labels)
+
+# Use stratified sampling to ensure high-value properties are represented in both sets
+X_train, X_test, y_train, y_test, bins_train, bins_test = train_test_split(
+    X_seq, y_seq, price_bins, test_size=0.2, random_state=42, stratify=price_bins
+)
+
+# Verify distribution
+print("Price bin distribution in full dataset:")
+print(price_bins.value_counts(normalize=True) * 100)
+
+print("\nPrice bin distribution in training set:")
+print(bins_train.value_counts(normalize=True) * 100)
+
+print("\nPrice bin distribution in test set:")
+print(bins_test.value_counts(normalize=True) * 100)
+```
+
+## 6. Improve the LSTM Model Architecture
+
+Replace your model definition with:
+
+```python
+# Build an improved LSTM model better at handling outliers
+model = Sequential()
+model.add(LSTM(128, activation='tanh', return_sequences=True, 
+             input_shape=(X_train.shape[1], X_train.shape[2]),
+             recurrent_dropout=0.2))
+model.add(BatchNormalization())
+model.add(LSTM(64, activation='tanh'))
+model.add(BatchNormalization())
+model.add(Dense(32, activation='relu'))
+model.add(Dropout(0.3))
+model.add(Dense(1))
+
+# Use Huber loss which is less sensitive to outliers than MSE
+model.compile(optimizer='adam', loss=Huber())
+```
+
+## 7. Add Advanced Callbacks
+
+Update your model training with:
+
+```python
+# Add callbacks for better training
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', patience=20, restore_best_weights=True
+)
+
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss', factor=0.2, patience=5, min_lr=0.0001
+)
+
+# Train with more epochs and class weights
+history = model.fit(
+    X_train, y_train,
+    epochs=200,
+    batch_size=32,
+    validation_split=0.1,
+    callbacks=[early_stopping, reduce_lr],
+    verbose=1
+)
+```
+
+## 8. Improve Prediction Visualization
+
+Replace your prediction visualization with:
+
+```python
+# Make predictions
+y_pred = model.predict(X_test)
+
+# Inverse transform predictions and actual values
+# If you used log transform:
+y_pred_actual = np.expm1(y_scaler.inverse_transform(y_pred))
+y_test_actual = np.expm1(y_scaler.inverse_transform(y_test))
+
+# Create results DataFrame
+results_df = pd.DataFrame({
+    'Actual': y_test_actual.flatten(),
+    'Predicted': y_pred_actual.flatten(),
+    'Error': y_test_actual.flatten() - y_pred_actual.flatten(),
+    'AbsError': np.abs(y_test_actual.flatten() - y_pred_actual.flatten()),
+    'PercentError': ((y_test_actual.flatten() - y_pred_actual.flatten()) / y_test_actual.flatten()) * 100
+})
+
+# Calculate metrics by price range
+bins = [0, 1000, 5000, 10000, 20000, np.inf]
+labels = ['<1k', '1k-5k', '5k-10k', '10k-20k', '>20k']
+results_df['PriceBin'] = pd.cut(results_df['Actual'], bins=bins, labels=labels)
+
+# Calculate summary metrics by bin
+bin_metrics = results_df.groupby('PriceBin').agg(
+    Count=('Actual', 'count'),
+    MAE=('AbsError', 'mean'),
+    MAPE=('PercentError', lambda x: np.mean(np.abs(x))),
+    AvgActual=('Actual', 'mean'),
+    AvgPredicted=('Predicted', 'mean')
+).reset_index()
+
+# Calculate overall metrics
+mae = np.mean(results_df['AbsError'])
+mape = np.mean(np.abs(results_df['PercentError']))
+rmse = np.sqrt(np.mean(np.square(results_df['Error'])))
+
+# Plot prediction results
+plt.figure(figsize=(14, 8))
+plt.plot(results_df.index, results_df['Actual'], 'b-', label='Actual', alpha=0.7)
+plt.plot(results_df.index, results_df['Predicted'], 'r--', label='Predicted', alpha=0.7)
+
+# Add metrics annotation
+plt.text(0.02, 0.95, f'MAE: {mae:.2f}\nMAPE: {mape:.2f}%\nRMSE: {rmse:.2f}', 
+         transform=plt.gca().transAxes, fontsize=12,
+         bbox=dict(facecolor='white', alpha=0.8))
+
+plt.title('House Price Prediction Results - Full Test Set', fontsize=16)
+plt.xlabel('Test Sample Index', fontsize=12)
+plt.ylabel('Price', fontsize=12)
+plt.legend(fontsize=12)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Plot MAE by price bin
+plt.figure(figsize=(12, 6))
+ax = sns.barplot(x='PriceBin', y='MAE', data=bin_metrics, palette='viridis')
+
+# Add value labels and counts
+for i, (mae, count) in enumerate(zip(bin_metrics['MAE'], bin_metrics['Count'])):
+    ax.text(i, mae + 10, f'MAE: {mae:.1f}', ha='center', fontsize=10)
+    ax.text(i, mae / 2, f'n={count}', ha='center', fontsize=10, color='white')
+
+plt.title('Mean Absolute Error by Price Range', fontsize=16)
+plt.xlabel('Price Range', fontsize=12)
+plt.ylabel('MAE', fontsize=12)
+plt.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+plt.show()
+
+# Plot MAPE by price bin
+plt.figure(figsize=(12, 6))
+ax = sns.barplot(x='PriceBin', y='MAPE', data=bin_metrics, palette='viridis')
+
+for i, mape in enumerate(bin_metrics['MAPE']):
+    ax.text(i, mape + 2, f'{mape:.1f}%', ha='center', fontsize=10)
+
+plt.title('Mean Absolute Percentage Error by Price Range', fontsize=16)
+plt.xlabel('Price Range', fontsize=12)
+plt.ylabel('MAPE (%)', fontsize=12)
+plt.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+plt.show()
+
+# Plot actual vs predicted scatter
+plt.figure(figsize=(10, 8))
+plt.scatter(results_df['Actual'], results_df['Predicted'], alpha=0.5)
+max_val = max(results_df['Actual'].max(), results_df['Predicted'].max())
+plt.plot([0, max_val], [0, max_val], 'r--', label='Perfect Prediction')
+plt.xlabel('Actual Price', fontsize=12)
+plt.ylabel('Predicted Price', fontsize=12)
+plt.title('Actual vs Predicted Prices', fontsize=16)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## 9. Add Error Analysis by Price Range
+
+```python
+# Plot error distribution by price range
+plt.figure(figsize=(14, 10))
+for i, bin_name in enumerate(results_df['PriceBin'].unique()):
+    plt.subplot(3, 2, i+1)
+    bin_data = results_df[results_df['PriceBin'] == bin_name]
+    sns.histplot(bin_data['PercentError'], kde=True)
+    plt.axvline(x=0, color='r', linestyle='--')
+    plt.title(f'Error Distribution - {bin_name} Price Range')
+    plt.xlabel('Percent Error')
+    plt.tight_layout()
+plt.show()
+```
+
+## 10. Try a Second Model with Oversampling
+
+Add this additional model training approach:
+
+```python
+# Create a second model with oversampling high-value properties
+from imblearn.over_sampling import RandomOverSampler
+
+# Define high-value threshold
+high_value_threshold = 10000
+
+# Create target variable for binary classification (high/low value)
+high_value_target = (y_original >= high_value_threshold).astype(int)
+
+# Create oversample strategy
+ros = RandomOverSampler(sampling_strategy=0.5, random_state=42)
+
+# Reshape sequences for oversampling
+X_seq_reshaped = X_seq.reshape(X_seq.shape[0], -1)
+
+# Apply oversampling
+X_seq_resampled, y_seq_resampled = ros.fit_resample(X_seq_reshaped, y_seq)
+
+# Reshape back to 3D
+X_seq_resampled = X_seq_resampled.reshape(-1, X_seq.shape[1], X_seq.shape[2])
+
+# Split the resampled data
+X_train_ros, X_test_ros, y_train_ros, y_test_ros = train_test_split(
+    X_seq_resampled, y_seq_resampled, test_size=0.2, random_state=42
+)
+
+# Build and train the model on resampled data
+model_ros = Sequential()
+model_ros.add(LSTM(128, activation='tanh', return_sequences=True, 
+             input_shape=(X_train_ros.shape[1], X_train_ros.shape[2]),
+             recurrent_dropout=0.2))
+model_ros.add(BatchNormalization())
+model_ros.add(LSTM(64, activation='tanh'))
+model_ros.add(BatchNormalization())
+model_ros.add(Dense(32, activation='relu'))
+model_ros.add(Dropout(0.3))
+model_ros.add(Dense(1))
+
+model_ros.compile(optimizer='adam', loss=Huber())
+
+# Train the model
+history_ros = model_ros.fit(
+    X_train_ros, y_train_ros,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.1,
+    callbacks=[early_stopping, reduce_lr],
+    verbose=1
+)
+
+# Compare both models
+y_pred_ros = model_ros.predict(X_test)
+y_pred_actual_ros = np.expm1(y_scaler.inverse_transform(y_pred_ros))
+
+# Calculate metrics
+mae_ros = np.mean(np.abs(y_test_actual - y_pred_actual_ros))
+mape_ros = np.mean(np.abs((y_test_actual - y_pred_actual_ros) / y_test_actual)) * 100
+rmse_ros = np.sqrt(np.mean(np.square(y_test_actual - y_pred_actual_ros)))
+
+# Compare both models
+print("Original Model Metrics:")
+print(f"MAE: {mae:.2f}")
+print(f"MAPE: {mape:.2f}%")
+print(f"RMSE: {rmse:.2f}")
+
+print("\nOversampled Model Metrics:")
+print(f"MAE: {mae_ros:.2f}")
+print(f"MAPE: {mape_ros:.2f}%")
+print(f"RMSE: {rmse_ros:.2f}")
+
+# Plot comparison
+plt.figure(figsize=(14, 7))
+plt.plot(results_df.index, results_df['Actual'], 'b-', label='Actual', alpha=0.7)
+plt.plot(results_df.index, results_df['Predicted'], 'r--', label='Original Model', alpha=0.5)
+plt.plot(results_df.index, y_pred_actual_ros.flatten(), 'g--', label='Oversampled Model', alpha=0.5)
+plt.title('Model Comparison - Original vs Oversampled', fontsize=16)
+plt.xlabel('Test Sample Index', fontsize=12)
+plt.ylabel('Price', fontsize=12)
+plt.legend(fontsize=12)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+## Summary of Improvements
+
+1. **Log transformation** of the target variable to handle the skewed price distribution
+2. **Robust scaling** instead of Min-Max to handle outliers better
+3. **Stratified sampling** to ensure high-value properties are properly represented
+4. **Improved model architecture** with batch normalization and Huber loss
+5. **Better callbacks** including learning rate reduction
+6. **Detailed error analysis** by price range 
+7. **Oversampling high-value properties** to give them more weight during training
+
+These changes should help your model better predict the high-value properties that were previously being underestimated. 
